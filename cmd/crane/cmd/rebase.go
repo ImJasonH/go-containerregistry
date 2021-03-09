@@ -16,9 +16,10 @@ package cmd
 
 import (
 	"fmt"
+	"log"
 
 	"github.com/google/go-containerregistry/pkg/crane"
-	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/spf13/cobra"
 )
 
@@ -29,48 +30,59 @@ func NewCmdRebase(options *[]crane.Option) *cobra.Command {
 	rebaseCmd := &cobra.Command{
 		Use:   "rebase",
 		Short: "Rebase an image onto a new base image",
-		Args:  cobra.NoArgs,
-		RunE: func(*cobra.Command, []string) error {
-			origImg, err := crane.Pull(orig, *options...)
-			if err != nil {
-				return fmt.Errorf("pulling %s: %v", orig, err)
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			if orig == "" {
+				orig = args[0]
+			} else if len(args) != 0 || args[0] != "" {
+				return fmt.Errorf("cannot use --original with positional argument")
 			}
 
-			oldBaseImg, err := crane.Pull(oldBase, *options...)
+			rebasedImg, err := crane.Rebase(orig, oldBase, newBase)
 			if err != nil {
-				return fmt.Errorf("pulling %s: %v", oldBase, err)
+				return fmt.Errorf("rebasing image: %v", err)
 			}
 
-			newBaseImg, err := crane.Pull(newBase, *options...)
-			if err != nil {
-				return fmt.Errorf("pulling %s: %v", newBase, err)
+			// If the new ref isn't provided, write over the original image.
+			// If that ref was provided by digest (e.g., output from
+			// another crane command), then strip that and push the
+			// rebased image by digest instead.
+			if rebased == "" {
+				log.Println("pushing rebased image as", orig)
+				rebased = orig
 			}
-
-			img, err := mutate.Rebase(origImg, oldBaseImg, newBaseImg)
+			digest, err := rebasedImg.Digest()
+			if err != nil {
+				return fmt.Errorf("digesting new image: %v", err)
+			}
+			r, err := name.ParseReference(rebased)
 			if err != nil {
 				return fmt.Errorf("rebasing: %v", err)
 			}
 
-			if err := crane.Push(img, rebased, *options...); err != nil {
+			if err := crane.Push(rebasedImg, rebased, *options...); err != nil {
+				return fmt.Errorf("pushing %s: %v", rebased, err)
+			}
+			if _, ok := r.(name.Digest); ok {
+				rebased = r.Context().Digest(digest.String()).String()
+			}
+
+			if err := crane.Push(rebasedImg, rebased, *options...); err != nil {
 				return fmt.Errorf("pushing %s: %v", rebased, err)
 			}
 
-			digest, err := img.Digest()
+			rebasedRef, err := name.ParseReference(rebased)
 			if err != nil {
-				return fmt.Errorf("digesting rebased: %v", err)
+				return fmt.Errorf("parsing %q: %v", rebased, err)
 			}
-			fmt.Println(digest.String())
+
+			fmt.Println(rebasedRef.Context().Digest(digest.String()))
 			return nil
 		},
 	}
-	rebaseCmd.Flags().StringVarP(&orig, "original", "", "", "Original image to rebase")
-	rebaseCmd.Flags().StringVarP(&oldBase, "old_base", "", "", "Old base image to remove")
-	rebaseCmd.Flags().StringVarP(&newBase, "new_base", "", "", "New base image to insert")
-	rebaseCmd.Flags().StringVarP(&rebased, "rebased", "", "", "Tag to apply to rebased image")
-
-	rebaseCmd.MarkFlagRequired("original")
-	rebaseCmd.MarkFlagRequired("old_base")
-	rebaseCmd.MarkFlagRequired("new_base")
-	rebaseCmd.MarkFlagRequired("rebased")
+	rebaseCmd.Flags().StringVar(&orig, "original", "", "Original image to rebase; use positional arg instead")
+	rebaseCmd.Flags().StringVar(&oldBase, "old_base", "", "Old base image to remove")
+	rebaseCmd.Flags().StringVar(&newBase, "new_base", "", "New base image to insert")
+	rebaseCmd.Flags().StringVarP(&rebased, "tag", "t", "", "Tag to apply to rebased image")
 	return rebaseCmd
 }
